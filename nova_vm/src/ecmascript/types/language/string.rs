@@ -315,9 +315,6 @@ impl<'a> String<'a> {
         strings: impl AsRef<[Self]>,
         gc: NoGcScope<'gc, '_>,
     ) -> String<'gc> {
-        // TODO: This function will need heavy changes once we support creating
-        // WTF-8 strings, since WTF-8 concatenation isn't byte concatenation.
-
         // We use this status enum so we can reuse one of the heap string inputs
         // if the output would be identical, and so we don't allocate at all
         // until it's clear we need a new heap string.
@@ -339,13 +336,90 @@ impl<'a> String<'a> {
             Status::Empty
         };
 
+        /// Check if we need to marry surrogates at the boundary
+        fn needs_surrogate_marriage(end_wtf8: &Wtf8, start_wtf8: &Wtf8) -> bool {
+            // Get the last code point from end and first from start
+            let end_code_points: Vec<_> = end_wtf8.code_points().collect();
+            let start_code_points: Vec<_> = start_wtf8.code_points().collect();
+
+            if end_code_points.is_empty() || start_code_points.is_empty() {
+                return false;
+            }
+
+            let last_cp = end_code_points.last().unwrap();
+            let first_cp = start_code_points.first().unwrap();
+
+            // Check if last is high surrogate (U+D800 to U+DBFF)
+            // and first is low surrogate (U+DC00 to U+DFFF)
+            let last_val = unsafe { std::mem::transmute::<CodePoint, u32>(*last_cp) };
+            let first_val = unsafe { std::mem::transmute::<CodePoint, u32>(*first_cp) };
+
+            (0xD800..=0xDBFF).contains(&last_val) && (0xDC00..=0xDFFF).contains(&first_val)
+        }
+
+        /// Marry high and low surrogates into a valid UTF-8 code point
+        fn marry_surrogates(high: CodePoint, low: CodePoint) -> [u8; 4] {
+            // Decode surrogates
+            let high_val = unsafe { std::mem::transmute::<CodePoint, u32>(high) };
+            let low_val = unsafe { std::mem::transmute::<CodePoint, u32>(low) };
+
+            // Combine into supplementary code point
+            let code_point = 0x10000 + ((high_val - 0xD800) << 10) + (low_val - 0xDC00);
+
+            // Encode as UTF-8 (4 bytes)
+            [
+                0xF0 | ((code_point >> 18) as u8),
+                0x80 | (((code_point >> 12) & 0x3F) as u8),
+                0x80 | (((code_point >> 6) & 0x3F) as u8),
+                0x80 | ((code_point & 0x3F) as u8),
+            ]
+        }
+
         fn push_string_to_wtf8(agent: &Agent, buf: &mut Wtf8Buf, string: String) {
-            match string {
-                String::String(heap_string) => {
-                    buf.push_wtf8(agent[heap_string].as_wtf8());
+            let string_wtf8 = string.as_wtf8(agent);
+            let buf_wtf8: &Wtf8 = buf;
+
+            // Check if we need to marry surrogates at the boundary
+            if needs_surrogate_marriage(buf_wtf8, string_wtf8) {
+                // Get the last code point from buf (high surrogate)
+                let mut buf_code_points: Vec<_> = buf_wtf8.code_points().collect();
+                let high_surrogate = buf_code_points.pop().unwrap();
+
+                // Get the first code point from string (low surrogate)
+                let mut string_code_points: Vec<_> = string_wtf8.code_points().collect();
+                let low_surrogate = string_code_points.remove(0);
+
+                // Rebuild buf without the high surrogate
+                let mut new_buf = Wtf8Buf::with_capacity(buf.len() + string.len(agent));
+                for cp in buf_code_points {
+                    new_buf.push(cp);
                 }
-                String::SmallString(small_string) => {
-                    buf.push_wtf8(small_string.as_wtf8());
+
+                // Create the married UTF-8 sequence
+                let married = marry_surrogates(high_surrogate, low_surrogate);
+
+                // Push the married 4-byte sequence
+                // SAFETY: The married sequence is valid UTF-8 by construction
+                unsafe {
+                    new_buf.push_str(core::str::from_utf8_unchecked(&married));
+                }
+
+                // Push the rest of the string (without the low surrogate)
+                for cp in string_code_points {
+                    new_buf.push(cp);
+                }
+
+                // Replace buf with new_buf
+                *buf = new_buf;
+            } else {
+                // Normal concatenation
+                match string {
+                    String::String(heap_string) => {
+                        buf.push_wtf8(agent[heap_string].as_wtf8());
+                    }
+                    String::SmallString(small_string) => {
+                        buf.push_wtf8(small_string.as_wtf8());
+                    }
                 }
             }
         }
@@ -367,28 +441,159 @@ impl<'a> String<'a> {
                 }
                 Status::ExistingString(heap_string) => {
                     let heap_string = *heap_string;
-                    let mut result =
-                        Wtf8Buf::with_capacity(agent[heap_string].len() + string.len(agent));
-                    result.push_wtf8(agent[heap_string].as_wtf8());
-                    push_string_to_wtf8(agent, &mut result, *string);
-                    status = Status::String(result)
-                }
-                Status::SmallString { data, len } => {
-                    let string_len = string.len(agent);
-                    if *len + string_len <= 7 {
-                        let String::SmallString(smstr) = string else {
-                            unreachable!()
-                        };
-                        data[*len..(*len + string_len)]
-                            .copy_from_slice(&smstr.data()[..string_len]);
-                        *len += string_len;
+                    let heap_wtf8 = agent[heap_string].as_wtf8();
+                    let string_wtf8 = string.as_wtf8(agent);
+
+                    // Check for surrogate marriage
+                    if needs_surrogate_marriage(heap_wtf8, string_wtf8) {
+                        // We need to modify the data, can't reuse ExistingString
+                        let mut result = Wtf8Buf::with_capacity(
+                            agent[heap_string].len() + string.len(agent)
+                        );
+
+                        // Get code points
+                        let mut heap_code_points: Vec<_> = heap_wtf8.code_points().collect();
+                        let high_surrogate = heap_code_points.pop().unwrap();
+
+                        let mut string_code_points: Vec<_> = string_wtf8.code_points().collect();
+                        let low_surrogate = string_code_points.remove(0);
+
+                        // Push all code points except the high surrogate
+                        for cp in heap_code_points {
+                            result.push(cp);
+                        }
+
+                        // Push the married sequence
+                        let married = marry_surrogates(high_surrogate, low_surrogate);
+                        // SAFETY: The married sequence is valid UTF-8 by construction
+                        unsafe {
+                            result.push_str(core::str::from_utf8_unchecked(&married));
+                        }
+
+                        // Push the rest (without low surrogate)
+                        for cp in string_code_points {
+                            result.push(cp);
+                        }
+
+                        status = Status::String(result);
                     } else {
-                        let mut result = Wtf8Buf::with_capacity(*len + string_len);
-                        // SAFETY: Since SmallStrings are guaranteed UTF-8, `&data[..len]` is the result
-                        // of concatenating UTF-8 strings, which is always valid UTF-8.
-                        result.push_str(unsafe { core::str::from_utf8_unchecked(&data[..*len]) });
+                        // Normal concatenation
+                        let mut result =
+                            Wtf8Buf::with_capacity(agent[heap_string].len() + string.len(agent));
+                        result.push_wtf8(agent[heap_string].as_wtf8());
                         push_string_to_wtf8(agent, &mut result, *string);
                         status = Status::String(result);
+                    }
+                }
+                Status::SmallString { data, len } => {
+                    let string_bytes = string.as_bytes(agent);
+
+                    // For SmallString, we know it's valid UTF-8, so we can work with bytes
+                    // Check if we need to marry surrogates at the byte level
+                    let needs_marriage = if *len >= 3 && string_bytes.len() >= 3 {
+                        data[*len - 3] == 0xED
+                            && (0xA0..=0xAF).contains(&data[*len - 2])
+                            && data[*len - 1] >= 0x80
+                            && data[*len - 1] <= 0xBF
+                            && string_bytes[0] == 0xED
+                            && (0xB0..=0xBF).contains(&string_bytes[1])
+                            && string_bytes[2] >= 0x80
+                            && string_bytes[2] <= 0xBF
+                    } else {
+                        false
+                    };
+
+                    if needs_marriage {
+                        // Calculate length after marriage: current - 3 + 4 + (string - 3)
+                        let new_len = *len - 3 + 4 + (string_bytes.len() - 3);
+
+                        if new_len <= 7 {
+                            // Still fits in SmallString after marriage
+                            // Decode and marry surrogates at byte level
+                            let high = 0xD800
+                                | (((data[*len - 2] & 0x0F) as u32) << 6)
+                                | ((data[*len - 1] & 0x3F) as u32);
+                            let low = 0xDC00
+                                | (((string_bytes[1] & 0x0F) as u32) << 6)
+                                | ((string_bytes[2] & 0x3F) as u32);
+                            let code_point = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                            let married = [
+                                0xF0 | ((code_point >> 18) as u8),
+                                0x80 | (((code_point >> 12) & 0x3F) as u8),
+                                0x80 | (((code_point >> 6) & 0x3F) as u8),
+                                0x80 | ((code_point & 0x3F) as u8),
+                            ];
+
+                            // Remove high surrogate
+                            *len -= 3;
+
+                            // Copy married sequence
+                            data[*len..*len + 4].copy_from_slice(&married);
+                            *len += 4;
+
+                            // Copy rest of string (skipping low surrogate)
+                            let rest_len = string_bytes.len() - 3;
+                            if rest_len > 0 {
+                                data[*len..*len + rest_len].copy_from_slice(&string_bytes[3..]);
+                                *len += rest_len;
+                            }
+                        } else {
+                            // Overflow to Wtf8Buf
+                            let mut result = Wtf8Buf::with_capacity(new_len);
+
+                            // SAFETY: SmallStrings are guaranteed valid UTF-8 before the surrogate
+                            let prefix_wtf8 = Wtf8::from_str(unsafe {
+                                core::str::from_utf8_unchecked(&data[..*len - 3])
+                            });
+                            result.push_wtf8(prefix_wtf8);
+
+                            // Create married sequence
+                            let high = 0xD800
+                                | (((data[*len - 2] & 0x0F) as u32) << 6)
+                                | ((data[*len - 1] & 0x3F) as u32);
+                            let low = 0xDC00
+                                | (((string_bytes[1] & 0x0F) as u32) << 6)
+                                | ((string_bytes[2] & 0x3F) as u32);
+                            let code_point = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                            let married = [
+                                0xF0 | ((code_point >> 18) as u8),
+                                0x80 | (((code_point >> 12) & 0x3F) as u8),
+                                0x80 | (((code_point >> 6) & 0x3F) as u8),
+                                0x80 | ((code_point & 0x3F) as u8),
+                            ];
+
+                            // SAFETY: The married sequence is valid UTF-8 by construction
+                            unsafe {
+                                result.push_str(core::str::from_utf8_unchecked(&married));
+                            }
+
+                            // Push the rest (skipping low surrogate)
+                            for (i, cp) in string.as_wtf8(agent).code_points().enumerate() {
+                                if i > 0 { // Skip first code point (low surrogate)
+                                    result.push(cp);
+                                }
+                            }
+
+                            status = Status::String(result);
+                        }
+                    } else {
+                        // Normal concatenation (no marriage needed)
+                        let string_len = string.len(agent);
+                        if *len + string_len <= 7 {
+                            let String::SmallString(smstr) = string else {
+                                unreachable!()
+                            };
+                            data[*len..(*len + string_len)]
+                                .copy_from_slice(&smstr.data()[..string_len]);
+                            *len += string_len;
+                        } else {
+                            let mut result = Wtf8Buf::with_capacity(*len + string_len);
+                            // SAFETY: Since SmallStrings are guaranteed UTF-8, `&data[..len]` is the result
+                            // of concatenating UTF-8 strings, which is always valid UTF-8.
+                            result.push_str(unsafe { core::str::from_utf8_unchecked(&data[..*len]) });
+                            push_string_to_wtf8(agent, &mut result, *string);
+                            status = Status::String(result);
+                        }
                     }
                 }
                 Status::String(buffer) => push_string_to_wtf8(agent, buffer, *string),

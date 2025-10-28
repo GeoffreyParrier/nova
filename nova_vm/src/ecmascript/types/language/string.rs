@@ -447,9 +447,8 @@ impl<'a> String<'a> {
                     // Check for surrogate marriage
                     if needs_surrogate_marriage(heap_wtf8, string_wtf8) {
                         // We need to modify the data, can't reuse ExistingString
-                        let mut result = Wtf8Buf::with_capacity(
-                            agent[heap_string].len() + string.len(agent)
-                        );
+                        let mut result =
+                            Wtf8Buf::with_capacity(agent[heap_string].len() + string.len(agent));
 
                         // Get code points
                         let mut heap_code_points: Vec<_> = heap_wtf8.code_points().collect();
@@ -569,7 +568,8 @@ impl<'a> String<'a> {
 
                             // Push the rest (skipping low surrogate)
                             for (i, cp) in string.as_wtf8(agent).code_points().enumerate() {
-                                if i > 0 { // Skip first code point (low surrogate)
+                                if i > 0 {
+                                    // Skip first code point (low surrogate)
                                     result.push(cp);
                                 }
                             }
@@ -590,7 +590,8 @@ impl<'a> String<'a> {
                             let mut result = Wtf8Buf::with_capacity(*len + string_len);
                             // SAFETY: Since SmallStrings are guaranteed UTF-8, `&data[..len]` is the result
                             // of concatenating UTF-8 strings, which is always valid UTF-8.
-                            result.push_str(unsafe { core::str::from_utf8_unchecked(&data[..*len]) });
+                            result
+                                .push_str(unsafe { core::str::from_utf8_unchecked(&data[..*len]) });
                             push_string_to_wtf8(agent, &mut result, *string);
                             status = Status::String(result);
                         }
